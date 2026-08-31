@@ -19,8 +19,8 @@ from .constants import (FAST_BATCH, PHASE_IDLE, PHASE_PAUSED, PHASE_REROI,
                         PHASE_ROI, PHASE_RUNNING, STATUS_ABORTED, STATUS_DONE,
                         STATUS_LOAD_FAILED, STATUS_SELECTING, STATUS_TRACKING)
 from .drawing import overlay_trajectory
-from .exporters import (move_video, open_video_writer, write_csv,
-                        write_interval_pngs, write_trajectory_png)
+from .exporters import (ensure_output_dir, move_video, open_video_writer,
+                        write_csv, write_interval_pngs, write_trajectory_png)
 from .queue_model import build_queue, find_videos
 from .session import VideoOpenError, VideoSession
 from .settings import AppSettings
@@ -409,8 +409,13 @@ class TrackerApp(tk.Tk):
         self._schedule_step()
 
     def _open_writer(self):
-        path = os.path.join(self._video_output_dir(), 'tracked.mp4')
-        self.writer = open_video_writer(path, self.session.fps, self.session.size)
+        try:
+            path = os.path.join(self._video_output_dir(), 'tracked.mp4')
+            self.writer = open_video_writer(path, self.session.fps, self.session.size)
+        except OSError as e:
+            self.writer = None
+            self.log(f'警告: 出力フォルダを作成できませんでした: {e}')
+            return
         if self.writer is None:
             self.log('警告: 追跡動画の書き出しを開始できませんでした。')
 
@@ -496,7 +501,8 @@ class TrackerApp(tk.Tk):
 
     # --------------------------------------------------------------- 保存
     def _video_output_dir(self):
-        return os.path.join(self.settings.output_root(), self.current_item.name)
+        """現在の動画の出力フォルダを用意して返す。"""
+        return ensure_output_dir(self.settings.output_root(), self.current_item.name)
 
     def _finish_video(self, reason):
         self._cancel_pending_step()
@@ -505,22 +511,34 @@ class TrackerApp(tk.Tk):
         item = self.current_item
         session = self.session
         settings = self.settings
-        out_dir = self._video_output_dir()
-        os.makedirs(out_dir, exist_ok=True)
 
         self.log(f'{reason}: {item.name}（{session.frame_idx} フレーム / '
                  f'追跡成功 {session.tracked_count}）')
 
+        try:
+            out_dir = self._video_output_dir()
+        except OSError as e:
+            self.log(f'出力フォルダを作成できませんでした: {e}')
+            self._abandon_video(item, reason)
+            return
+
         if settings.save_csv.get():
-            path = write_csv(os.path.join(out_dir, 'track.csv'), session.records)
-            self.log(f'CSV保存: {path}')
+            try:
+                path = write_csv(os.path.join(out_dir, 'track.csv'), session.records)
+                self.log(f'CSV保存: {path}')
+            except OSError as e:
+                self.log(f'CSVの保存に失敗しました: {e}')
 
         color, thickness = settings.line_bgra(), settings.line_thickness()
 
         if settings.save_png.get():
             path = write_trajectory_png(os.path.join(out_dir, 'full.png'), session.size,
                                         session.positions, color, thickness)
-            self.log(f'軌跡PNG保存: {path}')
+            if path:
+                self.log(f'軌跡PNG保存: {path}')
+            else:
+                self.log(f'軌跡PNGの保存に失敗しました: '
+                         f'{os.path.join(out_dir, "full.png")}')
 
         if settings.save_interval.get():
             interval = settings.interval_seconds()
@@ -543,6 +561,15 @@ class TrackerApp(tk.Tk):
         self.phase = PHASE_IDLE
         self._update_buttons()
         self._start_next_queued()   # 選択済みの次の動画へ
+
+    def _abandon_video(self, item, reason):
+        """出力できなかったときでも、後始末して次の動画へ進む。"""
+        self._release_session()
+        item.status = reason
+        self._refresh_queue_list()
+        self.phase = PHASE_IDLE
+        self._update_buttons()
+        self._start_next_queued()
 
     def _move_source(self, path):
         move_dir = self.settings.move_target()
